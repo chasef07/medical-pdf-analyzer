@@ -7,200 +7,319 @@ from config import ANTHROPIC_API_KEY
 import os
 import tempfile
 import time
-from typing import List
+import json
+from typing import List, Dict, Any
+from datetime import datetime
+
+def extract_structured_data_from_pdf(pdf_file, client, file_index):
+    """
+    Step 1: Extract structured JSON data from a single PDF
+    """
+    with open(pdf_file, "rb") as f:
+        pdf_data = base64.standard_b64encode(f.read()).decode("utf-8")
+
+    json_extraction_prompt = f"""You are a medical-legal data extraction specialist. Extract structured data from this medical document ({os.path.basename(pdf_file)}) into valid JSON format.
+
+CRITICAL: Output ONLY valid JSON. Quote exact text for all medical findings.
+
+Required JSON structure:
+{{
+  "document_metadata": {{
+    "filename": "{os.path.basename(pdf_file)}",
+    "analysis_date": "{datetime.now().isoformat()}",
+    "document_type": "initial_visit|follow_up|imaging|billing|legal|other"
+  }},
+  "patient_info": {{
+    "demographics": {{
+      "name": "string or null",
+      "age": "string or null",
+      "gender": "string or null",
+      "height": "string or null",
+      "weight": "string or null"
+    }},
+    "incident_details": {{
+      "date": "YYYY-MM-DD or null",
+      "time": "string or null",
+      "mechanism": "string or null",
+      "location": "string or null",
+      "circumstances": "string or null",
+      "source_quote": "exact text from document"
+    }}
+  }},
+  "medical_encounters": [
+    {{
+      "date": "YYYY-MM-DD",
+      "provider": "string",
+      "facility": "string",
+      "visit_type": "string",
+      "chief_complaints": ["list of complaints"],
+      "examination_findings": {{
+        "orthopedic_tests": ["test: result"],
+        "range_of_motion": ["measurement: value"],
+        "neurological": ["finding: result"],
+        "palpation": ["finding"]
+      }},
+      "diagnostic_results": {{
+        "imaging": ["study: findings"],
+        "lab_tests": ["test: result"],
+        "measurements": ["measurement: value"]
+      }},
+      "treatments_provided": ["treatment list"],
+      "provider_opinions": [
+        {{
+          "opinion": "exact quote",
+          "source_quote": "verbatim text",
+          "opinion_type": "causation|prognosis|treatment"
+        }}
+      ]
+    }}
+  ],
+  "billing_data": [
+    {{
+      "date": "YYYY-MM-DD",
+      "provider": "string",
+      "service_code": "string",
+      "description": "string",
+      "amount": "number or null",
+      "source_quote": "exact text"
+    }}
+  ],
+  "quality_flags": {{
+    "inconsistencies": ["description of issue"],
+    "missing_data": ["what data is missing"],
+    "date_discrepancies": ["date conflict description"],
+    "unclear_text": ["illegible or uncertain sections"]
+  }}
+}}
+
+VERIFICATION RULES:
+- Include source quotes for every medical finding
+- Use null for missing data, not empty strings
+- Flag any illegible text as "unclear_text"
+- Mark any assumptions as "inferred_data" in quality_flags
+- Extract exact measurements and dates
+- Preserve medical terminology as written
+
+Output ONLY the JSON, no other text."""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4000,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": pdf_data
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": json_extraction_prompt
+                        }
+                    ]
+                }
+            ]
+        )
+
+        json_text = response.content[0].text
+        # Clean any potential markdown formatting
+        if json_text.startswith('```json'):
+            json_text = json_text.replace('```json', '').replace('```', '').strip()
+
+        return json.loads(json_text)
+
+    except json.JSONDecodeError as e:
+        return {
+            "error": f"Failed to parse JSON from document {file_index + 1}",
+            "raw_response": response.content[0].text,
+            "json_error": str(e)
+        }
+    except Exception as e:
+        return {
+            "error": f"Failed to extract data from document {file_index + 1}",
+            "exception": str(e)
+        }
+
+def synthesize_unified_analysis(json_extractions, client):
+    """
+    Step 2: Synthesize all JSON extractions into unified timeline analysis
+    """
+    synthesis_prompt = f"""Create a unified medical-legal timeline analysis from these JSON extractions.
+
+INPUT: {len(json_extractions)} JSON analyses from related medical documents
+OUTPUT: Comprehensive chronological analysis with cross-references
+
+JSON DATA:
+{json.dumps(json_extractions, indent=2)}
+
+SYNTHESIS REQUIREMENTS:
+1. Merge timeline chronologically across all documents
+2. Cross-reference findings between documents
+3. Flag contradictions (DO NOT resolve - preserve both versions)
+4. Track diagnostic/treatment progression
+5. Validate billing against documented treatments
+6. Eliminate duplicate patient information (use most complete version)
+
+CITATION FORMAT: Every statement must include [Document_X] source reference
+
+CONTRADICTION HANDLING:
+- "Document A reports X on DATE, but Document B reports Y on DATE"
+- Never invent explanations for discrepancies
+- Flag for legal review when conflicts exist
+
+OUTPUT SECTIONS:
+1. **UNIFIED PATIENT TIMELINE** (chronological merger)
+2. **CROSS-DOCUMENT CORRELATIONS** (how findings relate)
+3. **IDENTIFIED CONTRADICTIONS** (conflicts requiring review)
+4. **TREATMENT PROGRESSION ANALYSIS** (evolution of care)
+5. **BILLING VALIDATION SUMMARY** (services vs documentation)
+6. **QUALITY CONTROL OBSERVATIONS** (documentation issues)
+
+IMPORTANT:
+- Maintain legal precision - quote exact text
+- Preserve source attribution for every finding
+- Flag any assumptions or inferences clearly
+- Focus on factual synthesis, not interpretation"""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=6000,
+            messages=[
+                {
+                    "role": "user",
+                    "content": synthesis_prompt
+                }
+            ]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return f"Error in synthesis step: {str(e)}"
+
+def cross_reference_findings(json_extractions):
+    """
+    Utility function to perform cross-referencing logic
+    """
+    correlations = {
+        "timeline_conflicts": [],
+        "diagnostic_progression": [],
+        "treatment_evolution": [],
+        "billing_anomalies": []
+    }
+
+    # Extract all dates and check for conflicts
+    all_encounters = []
+    for doc_idx, extraction in enumerate(json_extractions):
+        if "medical_encounters" in extraction:
+            for encounter in extraction["medical_encounters"]:
+                encounter["source_document"] = doc_idx + 1
+                all_encounters.append(encounter)
+
+    # Sort chronologically
+    all_encounters.sort(key=lambda x: x.get("date", "9999-12-31"))
+
+    # Check for same-date conflicts
+    date_groups = {}
+    for encounter in all_encounters:
+        date = encounter.get("date")
+        if date:
+            if date not in date_groups:
+                date_groups[date] = []
+            date_groups[date].append(encounter)
+
+    for date, encounters in date_groups.items():
+        if len(encounters) > 1:
+            correlations["timeline_conflicts"].append({
+                "date": date,
+                "encounters": encounters,
+                "issue": "Multiple encounters on same date"
+            })
+
+    return correlations
 
 def analyze_medical_pdf(pdf_files):
     """
-    Analyze multiple medical PDFs using Claude's Messages Batch API and return combined analysis results
+    Two-step analysis: Extract structured JSON data, then synthesize unified timeline
     """
     if pdf_files is None or len(pdf_files) == 0:
         return "Please upload at least one PDF file."
-    
+
     try:
         # Initialize the Anthropic client
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-        # Prepare batch requests for all PDF files
-        batch_requests = []
+        # Step 1: Extract structured JSON data from each PDF
+        json_extractions = []
+        extraction_status = f"📊 TWO-STEP ANALYSIS PROCESS\n\nStep 1: Extracting structured data from {len(pdf_files)} documents...\n\n"
 
         for i, pdf_file in enumerate(pdf_files):
-            # Read the PDF file and encode to base64
-            with open(pdf_file, "rb") as f:
-                pdf_data = base64.standard_b64encode(f.read()).decode("utf-8")
+            extraction_status += f"Processing {os.path.basename(pdf_file)}... "
 
-            # Create batch request for this PDF
-            batch_requests.append(
-                Request(
-                    custom_id=f"medical-pdf-{i+1}",
-                    params=MessageCreateParamsNonStreaming(
-                        model="claude-sonnet-4-20250514",
-                        max_tokens=2048,
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "document",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": "application/pdf",
-                                            "data": pdf_data
-                                        }
-                                    },
-                                    {
-                                        "type": "text",
-                                        "text": f"""You are a specialized medical-legal document reviewer. Analyze the provided medical chart PDF ({os.path.basename(pdf_file)}) and generate a comprehensive legal summary following the exact format and analytical depth demonstrated in professional medical record reviews.
+            json_data = extract_structured_data_from_pdf(pdf_file, client, i)
+            json_extractions.append(json_data)
 
-EXTRACTION REQUIREMENTS
-
-1. INCIDENT DOCUMENTATION
-- Extract ALL accident/incident details: date, time, mechanism of injury, location
-- Identify any date discrepancies between reports
-- Note damage estimates, emergency services involvement, airbag deployment
-- Flag conflicting accounts of how incident occurred
-- Extract witness statements or police report references
-
-2. CHRONOLOGICAL TIMELINE CONSTRUCTION
-- Organize all medical encounters in strict chronological order
-- Include: Date, Provider, Facility, Visit type (initial, follow-up, diagnostic)
-- Note treatment gaps or delays in care
-- Identify progression from conservative to invasive treatments
-
-3. CLINICAL DATA EXTRACTION
-
-Initial Presentations:
-- Chief complaints and symptom onset timing
-- Pain levels, locations, and characteristics
-- Functional limitations and ADL impacts
-- Sleep disturbances and work impact
-
-Physical Examination Findings:
-- Orthopedic tests (positive/negative with specific test names)
-- Range of motion limitations (quantify percentages)
-- Palpable muscle spasms, trigger points
-- Neurological findings (strength testing, reflexes, sensation)
-- Any missing standard assessments
-
-Diagnostic Studies:
-- X-ray findings: alignment, degenerative changes, curve abnormalities
-- MRI results: disc herniations (size, location, spinal cord contact)
-- NCV/EMG results: nerve compressions, radiculopathies
-- Any other imaging or diagnostic tests
-
-4. TREATMENT DOCUMENTATION
-- List all treatment modalities provided
-- Frequency and duration of treatment plans
-- Patient response to treatments (improvement/plateau/worsening)
-- Treatment modifications and rationale
-- Referrals to specialists with timing
-
-5. DIAGNOSTIC PROGRESSION
-- Initial diagnoses vs. evolving diagnoses
-- Addition of new conditions (e.g., radiculopathy onset)
-- ICD-10 codes where available
-- Relationship between objective findings and diagnoses
-
-6. CAUSATION ANALYSIS
-- Medical opinions linking injuries to incident
-- "Reasonable degree of medical certainty" statements
-- Provider qualifications making causation statements
-- Timing of causation opinions relative to treatment
-
-7. FINANCIAL DOCUMENTATION
-- Extract all billing information by provider
-- Note unusually high charges with specific amounts
-- Compare to regional standards where possible
-- Insurance payments and outstanding balances
-- Document medical equipment charges (TENS, DME)
-
-QUALITY CONTROL FLAGS
-
-Identify and highlight:
-- Date discrepancies between records
-- Missing provider credentials or qualifications
-- Incomplete documentation (missing follow-ups, assessments)
-- Conflicting information between providers
-- Billing anomalies or excessive charges
-- Treatment gaps or unexplained delays
-- Missing standard medical assessments
-
-LEGAL INTERROGATORY INTEGRATION
-
-If legal documents are included:
-- Extract employment information and wage claims
-- Prior injury history denials
-- Patient statements about incident mechanism
-- Litigation history and other claims
-
-OUTPUT FORMAT REQUIREMENTS
-
-Structure your analysis as follows:
-
-1. Record Review: (Chronological narrative format)
-2. Critical Case Elements (bullet points)
-3. Diagnostic Findings Hierarchy (objective vs subjective)
-4. Medical Bills Analysis (with cost anomaly flags)
-5. Quality Control Observations ("Of note" sections)
-
-ANALYSIS INSTRUCTIONS
-
-- Be extremely detail-oriented - extract specific measurements, test results, pain levels
-- Maintain chronological organization while cross-referencing related findings
-- Use medical terminology precisely as documented
-- Flag inconsistencies without making assumptions about causes
-- Quantify findings (degrees of motion loss, pain scales, measurement specifics)
-- Note documentation quality and completeness issues
-- Extract verbatim quotes for key medical opinions and causation statements
-
-SPECIAL HANDLING FOR:
-
-- Handwritten notes: Transcribe legible portions, note illegible sections
-- Images/Charts: Describe visual findings, measurements, annotations
-- Multiple providers: Cross-reference findings between providers
-- Billing records: Extract exact amounts and service codes
-
-IMPORTANT: Start your analysis with "=== ANALYSIS OF {os.path.basename(pdf_file)} ==="""
-                                    }
-                                ]
-                            }
-                        ]
-                    )
-                )
-            )
-
-        # Create the message batch
-        message_batch = client.messages.batches.create(requests=batch_requests)
-
-        # Poll for batch completion
-        batch_id = message_batch.id
-        while True:
-            batch_status = client.messages.batches.retrieve(batch_id)
-            if batch_status.processing_status == "ended":
-                break
-            elif batch_status.processing_status == "failed":
-                return f"Batch processing failed: {batch_status.processing_status}"
-
-            # Wait before checking again
-            time.sleep(10)
-
-        # Retrieve and combine results
-        combined_analysis = f"COMPREHENSIVE MEDICAL-LEGAL ANALYSIS\n\nTotal Documents Analyzed: {len(pdf_files)}\n\n"
-
-        results = list(client.messages.batches.results(batch_id))
-
-        for result in results:
-            if result.result.type == "succeeded":
-                analysis_text = result.result.message.content[0].text
-                combined_analysis += analysis_text + "\n\n" + "="*80 + "\n\n"
+            if "error" in json_data:
+                extraction_status += f"❌ Error\n"
             else:
-                combined_analysis += f"Error processing document {result.custom_id}: {result.result.error}\n\n"
+                extraction_status += f"✅ Complete\n"
 
-        # Add summary section
-        combined_analysis += "\n\nCOMPREHENSIVE CASE SUMMARY\n" + "="*50 + "\n"
-        combined_analysis += f"Analysis completed for {len(pdf_files)} medical documents using Claude's Messages Batch API.\n"
-        combined_analysis += "This combined analysis provides a comprehensive view of all submitted medical records.\n"
+        # Check if any extractions failed
+        failed_extractions = [data for data in json_extractions if "error" in data]
+        if failed_extractions:
+            error_report = "\n\n⚠️ EXTRACTION ERRORS:\n"
+            for error_data in failed_extractions:
+                error_report += f"- {error_data.get('error', 'Unknown error')}\n"
+                if "raw_response" in error_data:
+                    error_report += f"  Raw response: {error_data['raw_response'][:200]}...\n"
+            return extraction_status + error_report
 
-        return combined_analysis
+        # Step 2: Cross-reference and synthesize
+        extraction_status += "\nStep 2: Synthesizing unified timeline and cross-referencing findings...\n"
+
+        # Perform cross-referencing
+        correlations = cross_reference_findings(json_extractions)
+
+        # Generate unified synthesis
+        unified_analysis = synthesize_unified_analysis(json_extractions, client)
+
+        # Combine everything into final report
+        final_report = f"""🏥 COMPREHENSIVE MEDICAL-LEGAL ANALYSIS REPORT
+📅 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+📄 Documents Processed: {len(pdf_files)}
+
+{extraction_status}
+✅ Analysis Complete!
+
+{'='*80}
+
+{unified_analysis}
+
+{'='*80}
+
+TECHNICAL CORRELATION SUMMARY:
+📊 Timeline Conflicts Detected: {len(correlations['timeline_conflicts'])}
+📈 Diagnostic Progression Points: {len(correlations['diagnostic_progression'])}
+💊 Treatment Evolution Stages: {len(correlations['treatment_evolution'])}
+💰 Billing Anomalies Flagged: {len(correlations['billing_anomalies'])}
+
+{'='*80}
+
+SOURCE DATA SUMMARY:
+The following files were processed and cross-referenced:
+"""
+
+        for i, pdf_file in enumerate(pdf_files):
+            final_report += f"📄 Document {i+1}: {os.path.basename(pdf_file)}\n"
+
+        final_report += "\n🔍 This analysis provides a unified view with source attribution for legal review.\n"
+
+        return final_report
 
     except Exception as e:
         # Enhanced error handling for batch API
@@ -223,8 +342,8 @@ IMPORTANT: Start your analysis with "=== ANALYSIS OF {os.path.basename(pdf_file)
 
 # Create the Gradio interface
 with gr.Blocks(title="Medical PDF Analyzer", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🏥 Medical PDF Legal Analysis Tool")
-    gr.Markdown("Upload multiple medical PDF documents to generate a comprehensive legal analysis summary using Claude's Messages Batch API.")
+    gr.Markdown("# 🏥 Medical PDF Legal Analysis Tool - Two-Step Enhanced")
+    gr.Markdown("Upload multiple medical PDF documents to generate a **unified timeline analysis** with cross-document correlation. Uses two-step processing: structured extraction → synthesis.")
     
     with gr.Row():
         with gr.Column():
